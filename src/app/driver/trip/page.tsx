@@ -5,7 +5,8 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/auth-context';
 import { dataStore } from '@/lib/store';
 import { Shift, Bus, Trip } from '@/types';
-import { formatRupiah, formatTimeOnly } from '@/lib/utils';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
+import { formatRupiah, formatTimeOnly, generateUuid } from '@/lib/utils';
 import { 
   Bus as BusIcon, 
   Plus, 
@@ -30,6 +31,8 @@ export default function TripCashEntryPage() {
   // Passenger count state with prominent stepper
   const [passengerCount, setPassengerCount] = useState<number>(0);
   const [successToast, setSuccessToast] = useState<string>('');
+  const [errorToast, setErrorToast] = useState<string>('');
+  const [isSaving, setIsSaving] = useState<boolean>(false);
 
   useEffect(() => {
     if (!user) return;
@@ -44,8 +47,42 @@ export default function TripCashEntryPage() {
     const bus = buses.find((b) => b.id === shift.bus_id) || null;
     setActiveBus(bus);
 
+    // Initial load from local store
     const trips = dataStore.getTrips(shift.id);
     setPastTrips(trips);
+
+    // Also sync from Supabase if configured
+    if (isSupabaseConfigured && supabase) {
+      const client = supabase;
+      const fetchSupabaseTrips = async () => {
+        try {
+          const { data, error } = await client
+            .from('trips')
+            .select('*')
+            .eq('shift_id', shift.id)
+            .order('trip_number', { ascending: false });
+
+          if (error) {
+            console.error('[Supabase Error] Gagal memuat riwayat rit dari Supabase:', error.message, error);
+          } else if (data && data.length > 0) {
+            const mapped: Trip[] = data.map((t: any) => ({
+              id: t.id,
+              shift_id: t.shift_id,
+              trip_number: Number(t.trip_number),
+              cash_passenger_count: Number(t.cash_passenger_count),
+              ticket_price: Number(t.ticket_price),
+              total_cash_amount: Number(t.total_cash_amount),
+              created_at: t.created_at,
+            }));
+            setPastTrips(mapped);
+          }
+        } catch (err) {
+          console.error('[Supabase Exception] Error saat sync awal trips:', err);
+        }
+      };
+
+      fetchSupabaseTrips();
+    }
   }, [user, router]);
 
   const currentTripNumber = pastTrips.length + 1;
@@ -61,7 +98,7 @@ export default function TripCashEntryPage() {
     setPassengerCount((prev) => Math.max(0, prev - amount));
   };
 
-  const handleSaveTrip = () => {
+  const handleSaveTrip = async () => {
     if (!activeShift) return;
     if (passengerCount === 0) {
       if (!window.confirm('Jumlah penumpang 0 pax (rit kosong). Tetap simpan rit ini?')) {
@@ -69,17 +106,62 @@ export default function TripCashEntryPage() {
       }
     }
 
-    const savedTrip = dataStore.addTrip({
+    setIsSaving(true);
+    setErrorToast('');
+
+    const tripId = generateUuid();
+    const tripPayload = {
+      id: tripId,
+      shift_id: activeShift.id,
+      trip_number: currentTripNumber,
+      cash_passenger_count: passengerCount,
+      ticket_price: ticketPrice,
+      total_cash_amount: totalTripAmount,
+      created_at: new Date().toISOString(),
+    };
+
+    console.log('[Supabase Client] Mengirim data rit ke Supabase table "trips":', tripPayload);
+
+    let supabaseSaved = false;
+
+    // DIRECT Supabase insert call using Supabase Client
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('trips')
+          .insert(tripPayload)
+          .select();
+
+        if (error) {
+          console.error('[Supabase Error] Gagal menyimpan ke tabel "trips":', error.message, error);
+          setErrorToast(`Peringatan: Gagal kirim ke database online (${error.message}). Data disimpan lokal.`);
+        } else {
+          console.log('[Supabase Success] Rit berhasil terkirim ke Supabase:', data);
+          supabaseSaved = true;
+        }
+      } catch (err: any) {
+        console.error('[Supabase Exception] Koneksi ke Supabase gagal saat insert rit:', err);
+        setErrorToast(`Koneksi database bermasalah (${err?.message || 'Network Error'}). Tersimpan di cache HP.`);
+      }
+    } else {
+      console.warn('[Supabase Notice] Supabase Client tidak aktif atau kredensial kosong. Menggunakan penyimpanan lokal.');
+    }
+
+    // Save to local cache as well so UI updates smoothly and works offline
+    await dataStore.addTrip({
       shiftId: activeShift.id,
       passengers: passengerCount,
       ticketPrice: ticketPrice,
     });
 
-    // Refresh trips
     const updated = dataStore.getTrips(activeShift.id);
     setPastTrips(updated);
     setPassengerCount(0);
-    setSuccessToast(`Rit ke-${savedTrip.trip_number} berhasil disimpan: ${formatRupiah(savedTrip.total_cash_amount)}`);
+    setIsSaving(false);
+
+    setSuccessToast(
+      `Rit ke-${tripPayload.trip_number} berhasil disimpan${supabaseSaved ? ' & terkirim ke server Supabase' : ''}: ${formatRupiah(tripPayload.total_cash_amount)}`
+    );
 
     setTimeout(() => {
       setSuccessToast('');
@@ -125,6 +207,13 @@ export default function TripCashEntryPage() {
         </div>
       )}
 
+      {errorToast && (
+        <div className="p-3 bg-amber-500 text-white rounded-2xl text-xs font-bold flex items-center gap-2 shadow-lg">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          <span>{errorToast}</span>
+        </div>
+      )}
+
       {/* Main Counter Card with Stepper */}
       <div className="bg-white rounded-3xl p-5 border border-slate-200 shadow-sm text-center">
         <label className="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-2">
@@ -144,7 +233,7 @@ export default function TripCashEntryPage() {
           <button
             type="button"
             onClick={() => handleDecrement(1)}
-            disabled={passengerCount === 0}
+            disabled={passengerCount === 0 || isSaving}
             className="min-h-[58px] rounded-2xl bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-800 font-black text-2xl flex items-center justify-center transition border border-slate-300 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95"
           >
             <Minus className="w-8 h-8" />
@@ -152,7 +241,8 @@ export default function TripCashEntryPage() {
           <button
             type="button"
             onClick={() => handleIncrement(1)}
-            className="min-h-[58px] rounded-2xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-black text-2xl flex items-center justify-center transition shadow-lg shadow-blue-600/30 active:scale-95"
+            disabled={isSaving}
+            className="min-h-[58px] rounded-2xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-black text-2xl flex items-center justify-center transition shadow-lg shadow-blue-600/30 active:scale-95 disabled:opacity-50"
           >
             <Plus className="w-8 h-8" />
           </button>
@@ -164,8 +254,9 @@ export default function TripCashEntryPage() {
             <button
               key={val}
               type="button"
+              disabled={isSaving}
               onClick={() => handleIncrement(val)}
-              className="py-2 rounded-xl bg-slate-100 hover:bg-blue-50 hover:text-blue-700 text-slate-700 font-bold text-xs border border-slate-200 transition active:scale-95"
+              className="py-2 rounded-xl bg-slate-100 hover:bg-blue-50 hover:text-blue-700 text-slate-700 font-bold text-xs border border-slate-200 transition active:scale-95 disabled:opacity-50"
             >
               +{val}
             </button>
@@ -189,11 +280,21 @@ export default function TripCashEntryPage() {
         {/* Primary Action Button: "Simpan Trip Ini" */}
         <button
           type="button"
+          disabled={isSaving}
           onClick={handleSaveTrip}
-          className="w-full mt-4 min-h-[54px] bg-emerald-600 hover:bg-emerald-700 text-white font-black text-base rounded-2xl flex items-center justify-center gap-2 shadow-xl shadow-emerald-700/30 active:scale-98 transition"
+          className="w-full mt-4 min-h-[54px] bg-emerald-600 hover:bg-emerald-700 text-white font-black text-base rounded-2xl flex items-center justify-center gap-2 shadow-xl shadow-emerald-700/30 active:scale-98 transition disabled:opacity-50"
         >
-          <CheckCircle className="w-5 h-5" />
-          <span>Simpan Trip Ini</span>
+          {isSaving ? (
+            <>
+              <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              <span>Menyimpan ke Supabase...</span>
+            </>
+          ) : (
+            <>
+              <CheckCircle className="w-5 h-5" />
+              <span>Simpan Trip Ini</span>
+            </>
+          )}
         </button>
       </div>
 

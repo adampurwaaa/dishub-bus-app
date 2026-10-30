@@ -31,14 +31,14 @@ export default function StartShiftPage() {
     }
   }, [user, router]);
 
-  const handleStartShift = () => {
+  const handleStartShift = async () => {
     if (!user) return;
     if (!selectedBusId) {
       setError('Silakan pilih salah satu armada bus yang beroperasi.');
       return;
     }
 
-    dataStore.startShift(user.id, selectedBusId);
+    await dataStore.startShift(user.id, selectedBusId);
     router.push('/driver/trip');
   };
 

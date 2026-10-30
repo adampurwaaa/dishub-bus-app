@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { dataStore } from '@/lib/store';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { formatRupiah, formatDateTime } from '@/lib/utils';
 import { 
   DollarSign, 
@@ -14,13 +15,18 @@ import {
   ArrowUpRight,
   ShieldCheck,
   Building,
-  UserCheck
+  UserCheck,
+  RefreshCw,
+  Radio
 } from 'lucide-react';
 import Link from 'next/link';
 
 export default function AdminDashboardOverview() {
   const [records, setRecords] = useState<any[]>([]);
   const [buses, setBuses] = useState<any[]>([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [stats, setStats] = useState({
     totalIncome: 0,
     operationalBusesCount: 0,
@@ -30,25 +36,23 @@ export default function AdminDashboardOverview() {
     anomaliesCount: 0,
   });
 
-  useEffect(() => {
-    const recs = dataStore.getReconciliationRecords();
-    const busList = dataStore.getBuses();
+  const computeAndSetData = useCallback((recs: any[], busList: any[]) => {
     setRecords(recs);
     setBuses(busList);
 
     // Calculate metrics
-    const totalInc = recs.reduce((acc, r) => acc + Number(r.total_collected_amount), 0);
+    const totalInc = recs.reduce((acc, r) => acc + Number(r.total_collected_amount || 0), 0);
     const pendingCount = recs.filter((r) => r.status === 'PENDING').length;
     const anomalyCount = recs.filter((r) => r.isAnomaly).length;
     const opBuses = busList.filter((b) => b.status === 'OPERATIONAL').length;
 
     const bankInc = recs
       .filter((r) => r.settlement_method === 'BANK_TRANSFER')
-      .reduce((acc, r) => acc + Number(r.total_collected_amount), 0);
+      .reduce((acc, r) => acc + Number(r.total_collected_amount || 0), 0);
 
     const officerInc = recs
       .filter((r) => r.settlement_method === 'FIELD_OFFICER')
-      .reduce((acc, r) => acc + Number(r.total_collected_amount), 0);
+      .reduce((acc, r) => acc + Number(r.total_collected_amount || 0), 0);
 
     setStats({
       totalIncome: totalInc,
@@ -58,7 +62,71 @@ export default function AdminDashboardOverview() {
       cashOfficerIncome: officerInc,
       anomaliesCount: anomalyCount,
     });
+    setLastUpdated(new Date());
   }, []);
+
+  const loadData = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      const recs = await dataStore.fetchReconciliationRecords();
+      const busList = dataStore.getBuses();
+      computeAndSetData(recs, busList);
+    } catch (err) {
+      console.error('[Admin Dashboard] Gagal load data:', err);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [computeAndSetData]);
+
+  useEffect(() => {
+    loadData();
+
+    // Supabase Realtime Subscription for trips and settlements
+    if (isSupabaseConfigured && supabase) {
+      const client = supabase;
+      console.log('[Realtime] Mengaktifkan Realtime Subscription untuk tabel "trips" dan "settlements"...');
+
+      const channel = client
+        .channel('admin-dashboard-realtime')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'trips' },
+          (payload) => {
+            console.log('[Realtime Event] Perubahan tabel "trips" terdeteksi:', payload);
+            loadData();
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'settlements' },
+          (payload) => {
+            console.log('[Realtime Event] Perubahan tabel "settlements" terdeteksi:', payload);
+            loadData();
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'shifts' },
+          (payload) => {
+            console.log('[Realtime Event] Perubahan tabel "shifts" terdeteksi:', payload);
+            loadData();
+          }
+        )
+        .subscribe((status) => {
+          console.log('[Realtime Status]:', status);
+          if (status === 'SUBSCRIBED') {
+            setRealtimeConnected(true);
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            setRealtimeConnected(false);
+          }
+        });
+
+      return () => {
+        console.log('[Realtime] Menutup channel realtime subscription dashboard.');
+        client.removeChannel(channel);
+      };
+    }
+  }, [loadData]);
 
   const totalCalculated = stats.bankIncome + stats.cashOfficerIncome;
   const bankPercent = totalCalculated > 0 ? Math.round((stats.bankIncome / totalCalculated) * 100) : 50;
@@ -80,7 +148,29 @@ export default function AdminDashboardOverview() {
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
+          {/* Live Sync Indicator */}
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs shadow-sm">
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                realtimeConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'
+              }`}
+            />
+            <span className="font-semibold text-slate-700">
+              {realtimeConnected ? 'Realtime Aktif' : 'Polling Sync'}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={loadData}
+            disabled={isRefreshing}
+            title="Tarik pembaruan data dari Supabase"
+            className="p-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 transition shadow-sm disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} />
+          </button>
+
           <Link
             href="/admin/reconcile"
             className="bg-blue-700 hover:bg-blue-800 text-white text-xs md:text-sm font-bold px-4 py-2.5 rounded-xl shadow-md shadow-blue-700/20 flex items-center gap-1.5 transition"

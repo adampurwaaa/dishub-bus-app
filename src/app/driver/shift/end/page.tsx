@@ -5,7 +5,8 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/auth-context';
 import { dataStore } from '@/lib/store';
 import { Shift, Bus, Trip } from '@/types';
-import { formatRupiah, formatDateTime } from '@/lib/utils';
+import { formatRupiah, formatDateTime, generateUuid } from '@/lib/utils';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { 
   Building2, 
   UserCheck, 
@@ -71,7 +72,7 @@ export default function EndShiftSettlementPage() {
     setErrorMsg('');
   };
 
-  const handleSubmitReport = () => {
+  const handleSubmitReport = async () => {
     if (!activeShift || !user) return;
     setErrorMsg('');
 
@@ -89,8 +90,56 @@ export default function EndShiftSettlementPage() {
 
     setIsSubmitting(true);
 
+    const settlementId = generateUuid();
+    const settlementPayload = {
+      id: settlementId,
+      shift_id: activeShift.id,
+      driver_id: user.id,
+      total_collected_amount: totalAccumulatedAmount,
+      settlement_method: settlementMethod,
+      receipt_image_url: settlementMethod === 'BANK_TRANSFER' ? receiptUrl : null,
+      officer_pin_code: settlementMethod === 'FIELD_OFFICER' ? officerPin : null,
+      status: 'PENDING' as const,
+      created_at: new Date().toISOString(),
+    };
+
+    console.log('[Supabase Client] Mengirim data setoran ke Supabase table "settlements":', settlementPayload);
+
+    // DIRECT Supabase insert call using Supabase Client
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('settlements')
+          .insert(settlementPayload)
+          .select();
+
+        if (error) {
+          console.error('[Supabase Error] Gagal insert ke tabel "settlements":', error.message, error);
+        } else {
+          console.log('[Supabase Success] Setoran berhasil tersimpan ke tabel "settlements":', data);
+        }
+
+        // Close shift in Supabase
+        const { error: shiftCloseError } = await supabase
+          .from('shifts')
+          .update({
+            end_time: new Date().toISOString(),
+            status: 'CLOSED',
+          })
+          .eq('id', activeShift.id);
+
+        if (shiftCloseError) {
+          console.error('[Supabase Error] Gagal update status shift ke CLOSED:', shiftCloseError.message);
+        }
+      } catch (err: any) {
+        console.error('[Supabase Exception] Terjadi kegagalan jaringan saat insert settlements:', err);
+      }
+    } else {
+      console.warn('[Supabase Notice] Supabase Client tidak aktif atau kredensial kosong. Menggunakan penyimpanan lokal.');
+    }
+
     try {
-      const settlement = dataStore.submitSettlement({
+      const settlement = await dataStore.submitSettlement({
         shiftId: activeShift.id,
         driverId: user.id,
         totalAmount: totalAccumulatedAmount,
@@ -99,9 +148,10 @@ export default function EndShiftSettlementPage() {
         officerPinCode: settlementMethod === 'FIELD_OFFICER' ? officerPin : null,
       });
 
-      router.push(`/driver/confirmation?settlementId=${settlement.id}`);
+      router.push(`/driver/confirmation?settlementId=${settlementId || settlement.id}`);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Gagal mengirimkan laporan setoran.');
+      console.error('[App Error] Gagal memproses submitSettlement:', err);
+      setErrorMsg(err?.message || 'Gagal mengirimkan laporan setoran.');
       setIsSubmitting(false);
     }
   };

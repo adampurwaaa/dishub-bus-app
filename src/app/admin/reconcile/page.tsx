@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useAuth } from '@/context/auth-context';
 import { dataStore } from '@/lib/store';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { formatRupiah, formatDateTime } from '@/lib/utils';
 import { 
   FileCheck, 
@@ -16,7 +17,9 @@ import {
   UserCheck, 
   Filter, 
   Search,
-  ExternalLink
+  ExternalLink,
+  RefreshCw,
+  Radio
 } from 'lucide-react';
 
 export default function ReconcilePage() {
@@ -25,6 +28,8 @@ export default function ReconcilePage() {
   const [records, setRecords] = useState<any[]>([]);
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [realtimeConnected, setRealtimeConnected] = useState<boolean>(false);
   
   // Modal viewer state for receipt photo
   const [selectedReceiptUrl, setSelectedReceiptUrl] = useState<string | null>(null);
@@ -33,24 +38,66 @@ export default function ReconcilePage() {
   const [rejectingId, setRejectingId] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState<string>('Nominal transfer tidak sesuai dengan rekap rit.');
 
-  const refreshData = () => {
-    const list = dataStore.getReconciliationRecords();
-    setRecords(list);
-  };
+  const refreshData = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      const list = await dataStore.fetchReconciliationRecords();
+      setRecords(list);
+    } catch (err) {
+      console.error('[Reconcile Page] Error fetch data:', err);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
     refreshData();
-  }, []);
 
-  const handleApprove = (id: string) => {
+    // Supabase Realtime Subscription for automatic table updates
+    if (isSupabaseConfigured && supabase) {
+      const client = supabase;
+      console.log('[Realtime Reconcile] Mendengarkan pembaruan tabel "settlements" dan "trips"...');
+      const channel = client
+        .channel('admin-reconcile-realtime')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'settlements' },
+          (payload) => {
+            console.log('[Realtime Event Reconcile] Settlements change:', payload);
+            refreshData();
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'trips' },
+          (payload) => {
+            console.log('[Realtime Event Reconcile] Trips change:', payload);
+            refreshData();
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            setRealtimeConnected(true);
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            setRealtimeConnected(false);
+          }
+        });
+
+      return () => {
+        client.removeChannel(channel);
+      };
+    }
+  }, [refreshData]);
+
+  const handleApprove = async (id: string) => {
     if (!user) return;
-    dataStore.updateSettlementStatus(id, 'APPROVED', user.id);
+    await dataStore.updateSettlementStatus(id, 'APPROVED', user.id);
     refreshData();
   };
 
-  const handleRejectSubmit = () => {
+  const handleRejectSubmit = async () => {
     if (!user || !rejectingId) return;
-    dataStore.updateSettlementStatus(rejectingId, 'REJECTED', user.id, rejectReason);
+    await dataStore.updateSettlementStatus(rejectingId, 'REJECTED', user.id, rejectReason);
     setRejectingId(null);
     refreshData();
   };
@@ -69,16 +116,41 @@ export default function ReconcilePage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
-        <span className="text-xs font-bold uppercase tracking-wider text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
-          Verifikasi & Rekonsiliasi Kas Dishub
-        </span>
-        <h1 className="text-2xl md:text-3xl font-black text-slate-900 mt-1">
-          Rekonsiliasi Setoran Supir
-        </h1>
-        <p className="text-sm text-slate-500">
-          Verifikasi bukti transfer bank, periksa validitas rit harian, serta deteksi indikasi anomali/kecurangan.
-        </p>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <span className="text-xs font-bold uppercase tracking-wider text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+            Verifikasi & Rekonsiliasi Kas Dishub
+          </span>
+          <h1 className="text-2xl md:text-3xl font-black text-slate-900 mt-1">
+            Rekonsiliasi Setoran Supir
+          </h1>
+          <p className="text-sm text-slate-500">
+            Verifikasi bukti transfer bank, periksa validitas rit harian, serta deteksi indikasi anomali/kecurangan.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs shadow-sm">
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                realtimeConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'
+              }`}
+            />
+            <span className="font-semibold text-slate-700">
+              {realtimeConnected ? 'Realtime Aktif' : 'Polling Sync'}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={refreshData}
+            disabled={isRefreshing}
+            title="Tarik data terbaru dari Supabase"
+            className="p-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 transition shadow-sm disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`} />
+          </button>
+        </div>
       </div>
 
       {/* Filter and Search Bar */}

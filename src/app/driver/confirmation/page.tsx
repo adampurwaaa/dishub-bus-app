@@ -6,6 +6,7 @@ import { useAuth } from '@/context/auth-context';
 import { dataStore } from '@/lib/store';
 import { Settlement, Shift, Bus } from '@/types';
 import { formatRupiah, formatDateTime } from '@/lib/utils';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { 
   CheckCircle, 
   Clock, 
@@ -28,10 +29,45 @@ function ConfirmationContent() {
   const [shift, setShift] = useState<Shift | null>(null);
   const [bus, setBus] = useState<Bus | null>(null);
 
-  const reloadData = () => {
+  const reloadData = async () => {
     if (!settlementId) return;
+
+    // Check local store first
     const all = dataStore.getSettlements();
-    const found = all.find((s) => s.id === settlementId) || null;
+    let found = all.find((s) => s.id === settlementId) || null;
+
+    // Check Supabase if configured
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('settlements')
+          .select('*')
+          .eq('id', settlementId)
+          .single();
+
+        if (error) {
+          console.error('[Confirmation] Gagal fetch settlement dari Supabase:', error.message);
+        } else if (data) {
+          found = {
+            id: data.id,
+            shift_id: data.shift_id,
+            driver_id: data.driver_id,
+            total_collected_amount: Number(data.total_collected_amount),
+            settlement_method: data.settlement_method,
+            receipt_image_url: data.receipt_image_url,
+            officer_pin_code: data.officer_pin_code,
+            status: data.status,
+            rejection_reason: data.rejection_reason,
+            verified_at: data.verified_at,
+            verified_by: data.verified_by,
+            created_at: data.created_at,
+          };
+        }
+      } catch (err) {
+        console.error('[Confirmation] Exception fetch settlement:', err);
+      }
+    }
+
     setSettlement(found);
 
     if (found) {
@@ -47,6 +83,31 @@ function ConfirmationContent() {
 
   useEffect(() => {
     reloadData();
+
+    // Listen in realtime for verification status updates from Admin
+    if (isSupabaseConfigured && supabase && settlementId) {
+      const client = supabase;
+      const channel = client
+        .channel(`driver-settlement-${settlementId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'settlements',
+            filter: `id=eq.${settlementId}`,
+          },
+          (payload) => {
+            console.log('[Realtime Driver] Status setoran berubah:', payload);
+            reloadData();
+          }
+        )
+        .subscribe();
+
+      return () => {
+        client.removeChannel(channel);
+      };
+    }
   }, [settlementId]);
 
   if (!settlement) {

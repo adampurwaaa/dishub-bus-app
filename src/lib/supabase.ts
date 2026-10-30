@@ -7,7 +7,8 @@ export const isSupabaseConfigured = Boolean(
   supabaseUrl && 
   supabaseAnonKey && 
   !supabaseUrl.includes('your-project') &&
-  supabaseUrl.startsWith('http')
+  supabaseUrl.startsWith('http') &&
+  supabaseAnonKey !== 'your-anon-key'
 );
 
 // Create Supabase client (gracefully handles placeholder envs for demo fallback)
